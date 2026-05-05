@@ -1,0 +1,14 @@
+.env
+__pycache__/
+*.pyc
+*.pyo
+models/
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+*.db
+.DS_Store
+Thumbs.db
+/.claude/settings.local.json

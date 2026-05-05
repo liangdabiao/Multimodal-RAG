@@ -1,0 +1,220 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Multimodal RAG - PDF Intelligent Q&A</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #f5f5f5; color: #333; }
+
+.container { max-width: 960px; margin: 0 auto; padding: 20px; }
+
+h1 { font-size: 1.6rem; margin-bottom: 20px; color: #1a1a1a; }
+
+.card { background: #fff; border-radius: 10px; padding: 20px; margin-bottom: 16px; box-shadow: 0 1px 3px rgba(0,0,0,0.08); }
+.card h2 { font-size: 1rem; color: #666; margin-bottom: 12px; font-weight: 500; }
+
+.row { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+
+label { font-size: 0.85rem; color: #555; font-weight: 500; }
+
+input[type="file"] { font-size: 0.85rem; }
+select, input[type="text"] {
+  padding: 8px 12px; border: 1px solid #ddd; border-radius: 6px; font-size: 0.9rem;
+  outline: none; transition: border-color 0.2s;
+}
+select:focus, input[type="text"]:focus { border-color: #4a90d9; }
+
+button {
+  padding: 8px 18px; border: none; border-radius: 6px; font-size: 0.9rem; cursor: pointer;
+  transition: background 0.2s; font-weight: 500;
+}
+.btn-primary { background: #4a90d9; color: #fff; }
+.btn-primary:hover { background: #3a7bc8; }
+.btn-danger { background: #e74c3c; color: #fff; }
+.btn-danger:hover { background: #c0392b; }
+.btn-search { background: #27ae60; color: #fff; padding: 8px 24px; }
+.btn-search:hover { background: #219a52; }
+
+button:disabled { opacity: 0.5; cursor: not-allowed; }
+
+textarea {
+  width: 100%; padding: 10px 12px; border: 1px solid #ddd; border-radius: 6px;
+  font-size: 0.9rem; resize: vertical; min-height: 60px; outline: none;
+  font-family: inherit;
+}
+textarea:focus { border-color: #4a90d9; }
+
+.status { font-size: 0.85rem; color: #666; padding: 6px 0; }
+.status.error { color: #e74c3c; }
+.status.success { color: #27ae60; }
+
+.gallery { display: flex; gap: 12px; flex-wrap: wrap; }
+.gallery-item { text-align: center; }
+.gallery-item img {
+  max-width: 280px; max-height: 400px; border-radius: 6px;
+  border: 1px solid #eee; object-fit: contain; background: #fafafa;
+}
+.gallery-item .label { font-size: 0.78rem; color: #888; margin-top: 4px; }
+
+.answer {
+  background: #fafafa; border: 1px solid #eee; border-radius: 6px;
+  padding: 16px; margin-top: 12px; line-height: 1.6; white-space: pre-wrap;
+  font-size: 0.92rem;
+}
+
+.loading { display: inline-block; width: 14px; height: 14px; border: 2px solid #ddd;
+  border-top-color: #4a90d9; border-radius: 50%; animation: spin 0.6s linear infinite; margin-right: 6px; }
+@keyframes spin { to { transform: rotate(360deg); } }
+
+.hidden { display: none; }
+</style>
+</head>
+<body>
+<div class="container">
+
+  <h1>Multimodal RAG - PDF Intelligent Q&A</h1>
+
+  <!-- Upload -->
+  <div class="card">
+    <h2>Document Management</h2>
+    <div class="row">
+      <input type="file" id="fileInput" accept=".pdf">
+      <select id="docSelect"><option value="__all__">All Documents</option></select>
+    </div>
+    <div class="row" style="margin-top:12px">
+      <button class="btn-primary" id="encodeBtn" onclick="doEncode()">Encode & Index</button>
+      <button class="btn-danger" onclick="doClear()">Clear All</button>
+    </div>
+    <div class="status" id="encodeStatus"></div>
+  </div>
+
+  <!-- Query -->
+  <div class="card">
+    <h2>Ask Questions</h2>
+    <textarea id="questionInput" placeholder="Ask a question about your documents..." rows="2"></textarea>
+    <div style="margin-top:10px">
+      <button class="btn-search" id="searchBtn" onclick="doSearch()">Search & Answer</button>
+    </div>
+  </div>
+
+  <!-- Results -->
+  <div class="card" id="resultsCard" class="hidden">
+    <h2>Retrieved Pages</h2>
+    <div class="gallery" id="gallery"></div>
+    <h2 style="margin-top:16px">Answer</h2>
+    <div class="answer" id="answerBox">-</div>
+    <div class="status" id="searchStatus"></div>
+  </div>
+
+</div>
+
+<script>
+document.getElementById('fileInput').addEventListener('change', function() {
+  const file = this.files[0];
+  if (!file) return;
+  const formData = new FormData();
+  formData.append('file', file);
+  fetch('/api/upload', { method: 'POST', body: formData })
+    .then(r => r.json())
+    .then(data => {
+      if (data.error) return setStatus('encodeStatus', data.error, 'error');
+      refreshDocs(data.docs);
+      setStatus('encodeStatus', 'Uploaded: ' + data.doc_name, 'success');
+    });
+});
+
+function refreshDocs(docs) {
+  const sel = document.getElementById('docSelect');
+  sel.innerHTML = '<option value="__all__">All Documents</option>';
+  (docs || []).forEach(d => {
+    const opt = document.createElement('option');
+    opt.value = d; opt.textContent = d;
+    sel.appendChild(opt);
+  });
+  if (docs && docs.length > 0) sel.value = docs[docs.length - 1];
+}
+
+function doEncode() {
+  const docName = document.getElementById('docSelect').value;
+  if (!docName || docName === '__all__') {
+    return setStatus('encodeStatus', 'Please select a document first.', 'error');
+  }
+  const btn = document.getElementById('encodeBtn');
+  btn.disabled = true;
+  setStatus('encodeStatus', '<span class="loading"></span>Encoding...');
+
+  fetch('/api/encode', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({doc_name: docName})
+  })
+  .then(r => r.json())
+  .then(data => {
+    btn.disabled = false;
+    if (data.error) return setStatus('encodeStatus', data.error, 'error');
+    setStatus('encodeStatus', data.message, 'success');
+  })
+  .catch(e => { btn.disabled = false; setStatus('encodeStatus', e.message, 'error'); });
+}
+
+function doSearch() {
+  const question = document.getElementById('questionInput').value.trim();
+  const docName = document.getElementById('docSelect').value;
+  if (!question) return;
+
+  const btn = document.getElementById('searchBtn');
+  btn.disabled = true;
+  document.getElementById('gallery').innerHTML = '';
+  document.getElementById('answerBox').textContent = 'Generating answer...';
+  setStatus('searchStatus', '<span class="loading"></span>Searching & generating...');
+
+  fetch('/api/search', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({question, doc_name: docName})
+  })
+  .then(r => r.json())
+  .then(data => {
+    btn.disabled = false;
+    if (data.error) {
+      setStatus('searchStatus', data.error, 'error');
+      document.getElementById('answerBox').textContent = data.error;
+      return;
+    }
+    const gal = document.getElementById('gallery');
+    gal.innerHTML = '';
+    (data.pages || []).forEach(p => {
+      const div = document.createElement('div');
+      div.className = 'gallery-item';
+      div.innerHTML = '<img src="data:image/png;base64,' + p.image + '"><div class="label">' + p.label + '</div>';
+      gal.appendChild(div);
+    });
+    document.getElementById('answerBox').textContent = data.answer || '-';
+    setStatus('searchStatus', '');
+  })
+  .catch(e => { btn.disabled = false; setStatus('searchStatus', e.message, 'error'); });
+}
+
+function doClear() {
+  fetch('/api/clear', { method: 'POST' })
+    .then(r => r.json())
+    .then(() => {
+      refreshDocs([]);
+      document.getElementById('fileInput').value = '';
+      document.getElementById('gallery').innerHTML = '';
+      document.getElementById('answerBox').textContent = '-';
+      setStatus('encodeStatus', 'All data cleared.', 'success');
+      setStatus('searchStatus', '');
+    });
+}
+
+function setStatus(id, html, type) {
+  const el = document.getElementById(id);
+  el.innerHTML = html;
+  el.className = 'status' + (type ? ' ' + type : '');
+}
+</script>
+</body>
+</html>
