@@ -255,13 +255,20 @@ Flask 接收文件，保存到 data/uploads/{filename}.pdf
   │   如果选 "All Documents"，不加过滤，跨文档搜索
   │   返回 Top-K (默认 3) 条结果，每条包含 doc_name + page_idx + score
   │
-  ├── Step 3: 加载页面图片
+  ├── Step 3: 页面扩展 ±2
+  │   图书内容通常是连续的，一个主题可能跨越多页
+  │   对每个命中页，取其前后各 2 页（即 ±2，共 5 页）
+  │   自动去重：如果两个命中页距离 ≤4 页，交集部分不重复
+  │   自动边界检查：不会超出 PDF 实际页数
+  │   示例：命中第 18 页 → 展开为第 16、17、18、19、20 页
+  │
+  ├── Step 4: 加载页面图片
   │   根据 (doc_name, page_idx) 获取页面图片:
   │   优先从内存缓存 _image_cache 读取
   │   缓存未命中时，从 data/uploads/{doc_name} 用 PyMuPDF 按需加载
   │   图片转 PNG base64，返回给前端展示
   │
-  └── Step 4: LLM 生成回答
+  └── Step 5: LLM 生成回答
       构建多模态消息:
       content = [
         {type: "image_url", image_url: {url: "data:image/png;base64,..."}},
@@ -480,7 +487,7 @@ api_server.py (独立 API 服务:7861, 2 个 API 路由 — 问答接口，供�
 
 **`config.py`** — 配置中心。`Settings` dataclass 定义所有参数，`_load_env()` 从 `.env` 读取变量覆盖默认值，`_resolve_provider()` 根据 `EMBED_PROVIDER` 和 `LLM_PROVIDER` 分别解析 Embedding 和 LLM 的活跃配置。全局单例 `settings` 供所有模块导入。
 
-**`utils/pdf_processor.py`** — `pdf_to_images(pdf_path, dpi)` 用 PyMuPDF 将 PDF 逐页渲染为 PIL Image 列表。`PdfProcessingError` 自定义异常用于友好错误提示。无需 poppler。
+**`utils/pdf_processor.py`** — `pdf_to_images(pdf_path, dpi)` 用 PyMuPDF 将 PDF 逐页渲染为 PIL Image 列表。`get_page_count(pdf_path)` 快速获取 PDF 总页数（不加载图片），用于页面扩展的边界检查。无需 poppler。
 
 **`utils/image_utils.py`** — `image_to_data_uri(img, max_size, fmt)` 将 PIL Image 缩放后转为 base64 data URI（Cohere 使用）。`pil_to_base64(img, max_size, fmt)` 返回纯 base64 字符串（DashScope 使用）。
 
@@ -488,7 +495,7 @@ api_server.py (独立 API 服务:7861, 2 个 API 路由 — 问答接口，供�
 
 **`core/vector_store.py`** — `VectorStore` 封装 Zilliz 操作。首次连接自动创建集合。`insert_pages()` 按页插入向量，`search()` 支持按 doc_name 过滤。用 MilvusClient 的 search 方法做内积搜索。
 
-**`core/retriever.py`** — `Retriever` 组合 embedder + vector_store。`retrieve()` 依次调用编码查询 → 搜索 Zilliz → 返回 `RetrievalResult` 列表。单向量检索，无 MaxSim 聚合。
+**`core/retriever.py`** — `Retriever` 组合 embedder + vector_store。`retrieve()` 依次调用编码查询 → 搜索 Zilliz → 返回 `RetrievalResult` 列表。`expand_pages()` 对命中结果做 ±2 页扩展，自动去重和边界检查，让 LLM 获得更完整的上下文。
 
 **`core/generator.py`** — 双引擎 LLM 生成。`AnswerGenerator` 根据 `settings.llm_provider` 初始化 OpenAI 兼容客户端：DashScope 走 `dashscope.aliyuncs.com/compatible-mode/v1`，OpenRouter 走 `openrouter.ai/api/v1`。两者消息格式完全相同，`generate()` 构建多模态消息（图片 base64 + 文本 prompt），发给视觉大模型生成回答。
 

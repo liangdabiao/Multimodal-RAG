@@ -7,6 +7,17 @@ class PdfProcessingError(Exception):
     pass
 
 
+def get_page_count(pdf_path: str) -> int:
+    """Return total page count without loading images."""
+    try:
+        doc = fitz.open(pdf_path)
+        count = len(doc)
+        doc.close()
+        return count
+    except Exception:
+        return 0
+
+
 def pdf_to_images(pdf_path: str, dpi: int = None) -> list[Image.Image]:
     """Convert each PDF page to RGB PIL Image using PyMuPDF (no poppler needed)."""
     if dpi is None:

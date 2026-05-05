@@ -30,7 +30,7 @@ from config import settings
 from utils.pdf_processor import pdf_to_images
 from core.embedder import create_embedder
 from core.vector_store import VectorStore
-from core.retriever import Retriever
+from core.retriever import Retriever, expand_pages
 from core.generator import AnswerGenerator
 
 logging.basicConfig(
@@ -101,21 +101,24 @@ def query():
         if not results:
             return jsonify({"answer": "未找到相关页面。", "pages": []})
 
+        expanded = expand_pages(results, UPLOAD_DIR, window=2)
+
         pages = []
         context_images = []
-        for r in results:
-            img = get_page_image(r.doc_name, r.page_idx)
+        for doc_name_e, page_idx, score in expanded:
+            img = get_page_image(doc_name_e, page_idx)
             if img:
                 pages.append({
-                    "doc_name": r.doc_name,
-                    "page_idx": r.page_idx,
-                    "score": r.score,
+                    "doc_name": doc_name_e,
+                    "page_idx": page_idx,
+                    "score": score,
                 })
                 context_images.append(img)
 
         if not context_images:
             return jsonify({"answer": "源 PDF 文件未找到，请重新上传。", "pages": []})
 
+        logger.info("[API] 发送 %d 张图片给 LLM", len(context_images))
         answer = comps["generator"].generate(question, context_images)
         logger.info("[API] 回答: %s", answer[:100])
 

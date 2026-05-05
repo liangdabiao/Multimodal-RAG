@@ -8,7 +8,7 @@ from config import settings
 from utils.pdf_processor import pdf_to_images, PdfProcessingError
 from core.vector_store import VectorStore
 from core.embedder import create_embedder
-from core.retriever import Retriever
+from core.retriever import Retriever, expand_pages
 from core.generator import AnswerGenerator
 
 logging.basicConfig(
@@ -164,20 +164,23 @@ def search():
         logger.info("Retrieved %d pages", len(results))
 
         if not results:
-            return jsonify({"pages": [], "answer": "No relevant pages found."})
+            return jsonify({"pages": [], "answer": "未找到相关页面。"})
+
+        expanded = expand_pages(results, UPLOAD_DIR, window=2)
 
         gallery = []
         context_images = []
-        for r in results:
-            img = get_page_image(r.doc_name, r.page_idx)
+        for doc_name_e, page_idx, score in expanded:
+            img = get_page_image(doc_name_e, page_idx)
             if img:
-                label = f"{r.doc_name} - 第{r.page_idx + 1}页 (相似度: {r.score})"
-                gallery.append({"label": label, "doc_name": r.doc_name, "page_idx": r.page_idx})
+                label = f"{doc_name_e} - 第{page_idx + 1}页 (相似度: {score})"
+                gallery.append({"label": label, "doc_name": doc_name_e, "page_idx": page_idx})
                 context_images.append(img)
 
         if not context_images:
-            return jsonify({"pages": [], "answer": "Source PDF files not found. Please re-upload."})
+            return jsonify({"pages": [], "answer": "源 PDF 文件未找到，请重新上传。"})
 
+        logger.info("Sending %d images to LLM", len(context_images))
         answer = comps["generator"].generate(question, context_images)
         logger.info("LLM answer: %s", answer[:100])
 
