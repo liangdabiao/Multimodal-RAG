@@ -67,7 +67,8 @@ D:/PDF-AI/
 ├── .gitignore
 ├── requirements.txt        # Python 依赖（9 个包，无 PyTorch）
 ├── config.py               # 配置中心，从 .env 加载
-├── app.py                  # Flask Web 服务 + API 路由
+├── app.py                  # Flask Web 服务 + API 路由（端口 7860）
+├── api_server.py           # 独立 API 问答服务（端口 7861，供外部调用）
 ├── static/
 │   └── index.html          # 前端页面
 │
@@ -84,6 +85,8 @@ D:/PDF-AI/
 
 ## API 接口
 
+### Web 服务（端口 7860）
+
 | 方法 | 路径 | 说明 | 请求体 |
 |---|---|---|---|
 | GET | `/api/docs` | 获取所有已上传的文档列表 | 无 |
@@ -96,11 +99,58 @@ D:/PDF-AI/
 ```json
 {
   "pages": [
-    {"label": "report.pdf - Page 5 (score: 0.8234)", "image": "base64..."},
-    {"label": "report.pdf - Page 12 (score: 0.7891)", "image": "base64..."}
+    {"label": "report.pdf - 第5页 (相似度: 0.8234)", "doc_name": "report.pdf", "page_idx": 4},
+    {"label": "report.pdf - 第12页 (相似度: 0.7891)", "doc_name": "report.pdf", "page_idx": 11}
   ],
   "answer": "根据文档内容，该系统的核心区别在于..."
 }
+```
+
+### 独立 API 问答服务（端口 7861）
+
+`api_server.py` 提供轻量级问答接口，供外部程序集成调用，与 Web 服务共享相同的 Embedding、Zilliz、LLM 流程。
+
+**启动**：
+```bash
+python api_server.py
+```
+
+**查询接口**：
+
+```
+POST http://127.0.0.1:7861/api/query
+Content-Type: application/json
+
+{
+    "question": "什么是积木？",
+    "doc_name": "LEGO.pdf"
+}
+```
+
+- `question`（必需）：要问的问题
+- `doc_name`（可选）：限定搜索的文档，不传则搜索全部文档
+
+**返回示例**：
+```json
+{
+    "answer": "积木是一种可拼接的玩具组件...",
+    "pages": [
+        {"doc_name": "LEGO.pdf", "page_idx": 5, "score": 0.82},
+        {"doc_name": "LEGO.pdf", "page_idx": 12, "score": 0.75}
+    ]
+}
+```
+
+**文档列表接口**：
+```
+GET http://127.0.0.1:7861/api/docs
+```
+
+**调用示例（curl）**：
+```bash
+curl -X POST http://127.0.0.1:7861/api/query \
+  -H "Content-Type: application/json" \
+  -d '{"question": "文档的主要内容是什么？"}'
 ```
 
 ## 功能流程详解
@@ -410,8 +460,9 @@ Cohere 限制单张图片最大 5MB。系统默认将图片缩放到 1200px，�
 ### 模块依赖关系
 
 ```
-app.py (Flask Web 服务, 5 个 API 路由)
-  ├── config.py (配置中心, 从 .env 加载 8 个变量)
+app.py (Flask Web 服务:7860, 5 个 API 路由 — 文档管理 + 问答)
+api_server.py (独立 API 服务:7861, 2 个 API 路由 — 问答接口，供外部调用)
+  ├── config.py (配置中心, 从 .env 加载变量)
   ├── utils/pdf_processor.py (PDF → 图片, PyMuPDF)
   ├── core/vector_store.py (Zilliz 操作)
   ├── core/embedder.py (双引擎 Embedding: Cohere / DashScope, create_embedder() 工厂)
@@ -441,7 +492,9 @@ app.py (Flask Web 服务, 5 个 API 路由)
 
 **`core/generator.py`** — 双引擎 LLM 生成。`AnswerGenerator` 根据 `settings.llm_provider` 初始化 OpenAI 兼容客户端：DashScope 走 `dashscope.aliyuncs.com/compatible-mode/v1`，OpenRouter 走 `openrouter.ai/api/v1`。两者消息格式完全相同，`generate()` 构建多模态消息（图片 base64 + 文本 prompt），发给视觉大模型生成回答。
 
-**`app.py`** — Flask 服务。`data/uploads/` 持久化 PDF 文件，`_image_cache` 内存缓存页面图片（按需从 PDF 加载）。5 个 API 路由，每个都有 try/except + logging。组件懒加载（首次使用时初始化）。
+**`app.py`** — Flask Web 服务（端口 7860）。`data/uploads/` 持久化 PDF 文件，`_image_cache` 内存缓存页面图片（按需从 PDF 加载）。5 个 API 路由，每个都有 try/except + logging。组件懒加载（首次使用时初始化）。
+
+**`api_server.py`** — 独立 API 问答服务（端口 7861）。提供 `/api/query` 和 `/api/docs` 两个接口，供外部程序集成调用。与 `app.py` 共享相同的 Embedding、Zilliz、LLM 流程和 `data/uploads/` 数据目录，但不包含文档管理和前端。两个服务可同时运行，互不冲突。
 
 ### 扩展方向
 

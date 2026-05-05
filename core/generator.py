@@ -7,11 +7,10 @@ from config import settings
 logger = logging.getLogger(__name__)
 
 _SYSTEM_PROMPT = (
-    "Above are {n} retrieved document pages. "
-    "Read them carefully and answer the following question.\n\n"
-    "Question: {question}\n\n"
-    "Be concise and accurate. If the documents don't contain "
-    "relevant information, say so."
+    "以上是 {n} 个检索到的文档页面。"
+    "请仔细阅读并回答以下问题。\n\n"
+    "问题：{question}\n\n"
+    "请用中文回答，简洁准确。如果文档中没有相关信息，请说明。"
 )
 
 
