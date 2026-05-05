@@ -1,14 +1,13 @@
 import io
-import base64
 import logging
-import tempfile
 import os
 import traceback
+from pathlib import Path
 from flask import Flask, request, jsonify, send_file
 from config import settings
 from utils.pdf_processor import pdf_to_images, PdfProcessingError
 from core.vector_store import VectorStore
-from core.embedder import CohereEmbedder
+from core.embedder import create_embedder
 from core.retriever import Retriever
 from core.generator import AnswerGenerator
 
@@ -20,8 +19,12 @@ logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
+UPLOAD_DIR = Path(__file__).parent / "data" / "uploads"
+UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+
 _components = {}
-_doc_state = {"docs": [], "images": {}, "paths": {}}
+# image cache: doc_name -> list[PIL.Image], loaded on demand from PDF
+_image_cache = {}
 
 
 def get_components():
@@ -29,8 +32,8 @@ def get_components():
         logger.info("Connecting to Zilliz: %s", settings.milvus_uri)
         _components["vector_store"] = VectorStore()
     if "embedder" not in _components:
-        logger.info("Initializing Cohere embedder: %s", settings.embed_model)
-        _components["embedder"] = CohereEmbedder()
+        logger.info("Initializing embedder: %s (%s)", settings.embed_model, settings.embed_provider)
+        _components["embedder"] = create_embedder()
     if "retriever" not in _components:
         _components["retriever"] = Retriever(
             _components["embedder"], _components["vector_store"]
@@ -41,15 +44,47 @@ def get_components():
     return _components
 
 
-def pil_to_base64(img):
-    buf = io.BytesIO()
-    img.save(buf, format="PNG")
-    return base64.b64encode(buf.getvalue()).decode()
+def get_doc_names():
+    """List all PDF files in the upload directory."""
+    return sorted(f.name for f in UPLOAD_DIR.glob("*.pdf"))
+
+
+def get_page_image(doc_name: str, page_idx: int):
+    """Get a page image from cache or load from PDF on demand."""
+    if doc_name not in _image_cache:
+        pdf_path = UPLOAD_DIR / doc_name
+        if pdf_path.exists():
+            logger.info("Loading images from %s (on demand)", doc_name)
+            _image_cache[doc_name] = pdf_to_images(str(pdf_path))
+        else:
+            return None
+    images = _image_cache.get(doc_name, [])
+    if page_idx < len(images):
+        return images[page_idx]
+    return None
 
 
 @app.route("/")
 def index():
     return send_file("static/index.html")
+
+
+@app.route("/api/docs", methods=["GET"])
+def list_docs():
+    """Return all available documents (from disk, not just in-memory)."""
+    return jsonify({"docs": get_doc_names()})
+
+
+@app.route("/api/image/<doc_name>/<int:page_idx>")
+def serve_image(doc_name, page_idx):
+    """Serve a PDF page as PNG image."""
+    img = get_page_image(doc_name, page_idx)
+    if img is None:
+        return "Not found", 404
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    buf.seek(0)
+    return send_file(buf, mimetype="image/png")
 
 
 @app.route("/api/upload", methods=["POST"])
@@ -61,16 +96,15 @@ def upload():
         return jsonify({"error": "Only PDF files are supported"}), 400
 
     doc_name = f.filename
-    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
-    f.save(tmp.name)
-    tmp.close()
-    logger.info("Uploaded: %s -> %s", doc_name, tmp.name)
+    save_path = UPLOAD_DIR / doc_name
+    f.save(str(save_path))
+    logger.info("Saved: %s", save_path)
 
-    _doc_state["paths"][doc_name] = tmp.name
-    if doc_name not in _doc_state["docs"]:
-        _doc_state["docs"].append(doc_name)
+    # Invalidate cache if re-uploading same doc
+    if doc_name in _image_cache:
+        del _image_cache[doc_name]
 
-    return jsonify({"doc_name": doc_name, "docs": _doc_state["docs"]})
+    return jsonify({"doc_name": doc_name, "docs": get_doc_names()})
 
 
 @app.route("/api/encode", methods=["POST"])
@@ -78,21 +112,21 @@ def encode():
     data = request.json or {}
     doc_name = data.get("doc_name", "")
 
-    if doc_name not in _doc_state["paths"]:
-        return jsonify({"error": "Please upload a PDF first"}), 400
+    save_path = UPLOAD_DIR / doc_name
+    if not save_path.exists():
+        return jsonify({"error": f"File not found: {doc_name}"}), 400
 
     try:
-        pdf_path = _doc_state["paths"][doc_name]
         logger.info("Converting PDF to images: %s", doc_name)
-        images = pdf_to_images(pdf_path)
-        _doc_state["images"][doc_name] = images
+        images = pdf_to_images(str(save_path))
         n_pages = len(images)
+        _image_cache[doc_name] = images
         logger.info("Converted %d pages", n_pages)
 
         comps = get_components()
-        logger.info("Encoding %d pages via Cohere API...", n_pages)
+        logger.info("Encoding %d pages via %s API...", n_pages, settings.embed_provider)
         page_vectors = comps["embedder"].encode_images(images)
-        logger.info("Got %d vectors, dim=%d", len(page_vectors), len(page_vectors[0]) if page_vectors else 0)
+        logger.info("Got %d vectors", len(page_vectors))
 
         total_rows = comps["vector_store"].insert_pages(doc_name, page_vectors)
         logger.info("Inserted %d rows into Zilliz", total_rows)
@@ -114,11 +148,13 @@ def search():
 
     if not question:
         return jsonify({"error": "Please enter a question"}), 400
-    if not _doc_state["images"]:
-        return jsonify({"error": "No documents indexed yet"}), 400
+
+    # Check that at least some docs exist on disk
+    if not get_doc_names():
+        return jsonify({"error": "No documents uploaded yet"}), 400
 
     try:
-        logger.info("Search: question='%s', doc='%s'", question[:50], doc_name)
+        logger.info("Search: question='%s', doc='%s'", question[:80], doc_name)
         comps = get_components()
         filter_doc = None if doc_name == "__all__" else doc_name
 
@@ -133,15 +169,14 @@ def search():
         gallery = []
         context_images = []
         for r in results:
-            imgs = _doc_state["images"].get(r.doc_name, [])
-            if r.page_idx < len(imgs):
-                label = f"{r.doc_name} - Page {r.page_idx + 1} (score: {r.score})"
-                b64 = pil_to_base64(imgs[r.page_idx])
-                gallery.append({"label": label, "image": b64})
-                context_images.append(imgs[r.page_idx])
+            img = get_page_image(r.doc_name, r.page_idx)
+            if img:
+                label = f"{r.doc_name} - 第{r.page_idx + 1}页 (相似度: {r.score})"
+                gallery.append({"label": label, "doc_name": r.doc_name, "page_idx": r.page_idx})
+                context_images.append(img)
 
         if not context_images:
-            return jsonify({"pages": gallery, "answer": "Images not found in cache."})
+            return jsonify({"pages": [], "answer": "Source PDF files not found. Please re-upload."})
 
         answer = comps["generator"].generate(question, context_images)
         logger.info("LLM answer: %s", answer[:100])
@@ -154,20 +189,18 @@ def search():
 
 @app.route("/api/clear", methods=["POST"])
 def clear():
-    _doc_state["docs"] = []
-    _doc_state["images"] = {}
-    for path in _doc_state["paths"].values():
-        try:
-            os.unlink(path)
-        except OSError:
-            pass
-    _doc_state["paths"] = {}
+    # Clear Zilliz
     try:
         comps = get_components()
         comps["vector_store"].drop_collection()
         comps["vector_store"]._ensure_collection(settings.collection_name)
     except Exception:
         pass
+
+    # Clear disk files and cache
+    for f in UPLOAD_DIR.glob("*.pdf"):
+        f.unlink()
+    _image_cache.clear()
     logger.info("All data cleared")
     return jsonify({"status": "ok"})
 

@@ -6,17 +6,31 @@ from config import settings
 
 logger = logging.getLogger(__name__)
 
+_SYSTEM_PROMPT = (
+    "Above are {n} retrieved document pages. "
+    "Read them carefully and answer the following question.\n\n"
+    "Question: {question}\n\n"
+    "Be concise and accurate. If the documents don't contain "
+    "relevant information, say so."
+)
+
 
 class AnswerGenerator:
     def __init__(self):
-        self.client = OpenAI(
-            api_key=settings.openrouter_api_key,
-            base_url="https://openrouter.ai/api/v1",
-            timeout=120.0,
-        )
+        if settings.llm_provider == "openrouter":
+            self.client = OpenAI(
+                api_key=settings.openrouter_api_key,
+                base_url="https://openrouter.ai/api/v1",
+                timeout=120.0,
+            )
+        else:
+            self.client = OpenAI(
+                api_key=settings.dashscope_api_key,
+                base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
+                timeout=120.0,
+            )
 
     def generate(self, question: str, context_images: list[Image.Image]) -> str:
-        """Send retrieved page images + question to Qwen3.5, return answer."""
         content = []
         for img in context_images:
             content.append({
@@ -25,16 +39,11 @@ class AnswerGenerator:
             })
         content.append({
             "type": "text",
-            "text": (
-                f"Above are {len(context_images)} retrieved document pages.\n"
-                f"Read them carefully and answer the following question:\n\n"
-                f"Question: {question}\n\n"
-                f"Be concise and accurate. If the documents don't contain "
-                f"relevant information, say so."
-            ),
+            "text": _SYSTEM_PROMPT.format(n=len(context_images), question=question),
         })
 
-        logger.info(f"Calling LLM: {settings.generation_model}, {len(context_images)} images")
+        logger.info("Calling LLM [%s]: %s, %d images",
+                     settings.llm_provider, settings.generation_model, len(context_images))
         response = self.client.chat.completions.create(
             model=settings.generation_model,
             messages=[{"role": "user", "content": content}],
@@ -44,8 +53,8 @@ class AnswerGenerator:
 
         text = response.choices[0].message.content
         if not text:
-            logger.warning("LLM returned empty content. Model: %s, finish_reason: %s",
-                           settings.generation_model,
+            logger.warning("LLM returned empty content. Provider: %s, model: %s, finish_reason: %s",
+                           settings.llm_provider, settings.generation_model,
                            response.choices[0].finish_reason)
             return "(LLM returned no content)"
 

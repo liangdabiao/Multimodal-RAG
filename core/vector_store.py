@@ -57,6 +57,7 @@ class VectorStore:
             for idx, vec in enumerate(page_vectors)
         ]
         self.client.insert(collection_name, rows)
+        self.client.flush(collection_name)
         return len(rows)
 
     def search(self, query_vector: list[float], top_k: int = None,

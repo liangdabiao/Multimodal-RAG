@@ -1,4 +1,5 @@
 cohere>=5.0.0
+dashscope>=1.14.0
 pymilvus>=2.4.0
 openai>=1.0.0
 PyMuPDF>=1.24.0

@@ -1,6 +1,6 @@
 import logging
 from dataclasses import dataclass
-from core.embedder import CohereEmbedder
+from core.embedder import BaseEmbedder
 from core.vector_store import VectorStore
 from config import settings
 
@@ -15,7 +15,7 @@ class RetrievalResult:
 
 
 class Retriever:
-    def __init__(self, embedder: CohereEmbedder, vector_store: VectorStore):
+    def __init__(self, embedder: BaseEmbedder, vector_store: VectorStore):
         self.embedder = embedder
         self.vector_store = vector_store
 
