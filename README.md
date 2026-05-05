@@ -34,6 +34,11 @@ Top-K 最相关页面
 AI 直接"看图"回答问题
 ```
 
+### 实际演示：
+
+![](./ScreenShot_2026-05-05_164841_191.png)
+![](./ScreenShot_2026-05-05_180009_428.png) 
+
 **核心优势**：
 - 无需本地 GPU，无需安装 PyTorch 或 poppler
 - 所有 AI 计算通过云端 API 完成（Embedding + LLM 均支持 DashScope 和 OpenRouter）
