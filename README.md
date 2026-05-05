@@ -511,6 +511,11 @@ api_server.py (独立 API 服务:7861, 2 个 API 路由 — 问答接口，供�
 - **添加对话历史**：在 `app.py` 中增加会话管理，维护多轮对话上下文
 - **前端升级**：`static/index.html` 为纯原生 HTML/JS，可按需引入 Vue/React 或替换为其他前端框架
 
+### 参考和致谢
+
+本项目参考了：https://mp.weixin.qq.com/s/qf_u3eAseYNyMlyTpXk51Q ，但是技术选型和功能都不同，可以看看文章内容。
+致谢： https://linux.do ，感谢佬友一直支持
+
 ## License
 
 MIT
