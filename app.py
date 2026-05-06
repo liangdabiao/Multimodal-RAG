@@ -4,8 +4,9 @@ import os
 import traceback
 from pathlib import Path
 from flask import Flask, request, jsonify, send_file
+from PIL import Image
 from config import settings
-from utils.pdf_processor import pdf_to_images, PdfProcessingError
+from utils.pdf_processor import pdf_to_images, pdf_page_to_image, PdfProcessingError
 from core.vector_store import VectorStore
 from core.embedder import create_embedder
 from core.retriever import Retriever, expand_pages
@@ -23,8 +24,29 @@ UPLOAD_DIR = Path(__file__).parent / "data" / "uploads"
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 _components = {}
-# image cache: doc_name -> list[PIL.Image], loaded on demand from PDF
-_image_cache = {}
+# page cache: (doc_name, page_idx) -> PIL.Image, single page per entry
+_page_cache: dict[tuple[str, int], Image.Image] = {}
+_PAGE_CACHE_MAX = 64
+
+
+def _get_page(doc_name: str, page_idx: int):
+    """Get a single page image, load from disk if not cached."""
+    key = (doc_name, page_idx)
+    if key not in _page_cache:
+        pdf_path = UPLOAD_DIR / doc_name
+        if not pdf_path.exists():
+            return None
+        try:
+            _page_cache[key] = pdf_page_to_image(str(pdf_path), page_idx)
+        except Exception:
+            logger.warning("Failed to load %s page %d", doc_name, page_idx)
+            return None
+        # Evict oldest entries if cache too large
+        if len(_page_cache) > _PAGE_CACHE_MAX:
+            keys = list(_page_cache.keys())
+            for k in keys[: len(keys) - _PAGE_CACHE_MAX + 16]:
+                del _page_cache[k]
+    return _page_cache[key]
 
 
 def get_components():
@@ -50,18 +72,7 @@ def get_doc_names():
 
 
 def get_page_image(doc_name: str, page_idx: int):
-    """Get a page image from cache or load from PDF on demand."""
-    if doc_name not in _image_cache:
-        pdf_path = UPLOAD_DIR / doc_name
-        if pdf_path.exists():
-            logger.info("Loading images from %s (on demand)", doc_name)
-            _image_cache[doc_name] = pdf_to_images(str(pdf_path))
-        else:
-            return None
-    images = _image_cache.get(doc_name, [])
-    if page_idx < len(images):
-        return images[page_idx]
-    return None
+    return _get_page(doc_name, page_idx)
 
 
 @app.route("/")
@@ -100,9 +111,10 @@ def upload():
     f.save(str(save_path))
     logger.info("Saved: %s", save_path)
 
-    # Invalidate cache if re-uploading same doc
-    if doc_name in _image_cache:
-        del _image_cache[doc_name]
+    # Invalidate page cache if re-uploading same doc
+    keys_to_del = [k for k in _page_cache if k[0] == doc_name]
+    for k in keys_to_del:
+        del _page_cache[k]
 
     return jsonify({"doc_name": doc_name, "docs": get_doc_names()})
 
@@ -120,7 +132,6 @@ def encode():
         logger.info("Converting PDF to images: %s", doc_name)
         images = pdf_to_images(str(save_path))
         n_pages = len(images)
-        _image_cache[doc_name] = images
         logger.info("Converted %d pages", n_pages)
 
         comps = get_components()
@@ -203,7 +214,7 @@ def clear():
     # Clear disk files and cache
     for f in UPLOAD_DIR.glob("*.pdf"):
         f.unlink()
-    _image_cache.clear()
+    _page_cache.clear()
     logger.info("All data cleared")
     return jsonify({"status": "ok"})
 

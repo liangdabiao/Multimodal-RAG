@@ -27,7 +27,7 @@ from pathlib import Path
 
 from flask import Flask, request, jsonify, send_file
 from config import settings
-from utils.pdf_processor import pdf_to_images
+from utils.pdf_processor import pdf_page_to_image
 from core.embedder import create_embedder
 from core.vector_store import VectorStore
 from core.retriever import Retriever, expand_pages
@@ -44,7 +44,26 @@ app = Flask(__name__)
 UPLOAD_DIR = Path(__file__).parent / "data" / "uploads"
 
 _components = {}
-_image_cache = {}
+_page_cache: dict[tuple[str, int], Image.Image] = {}
+_PAGE_CACHE_MAX = 64
+
+
+def _get_page(doc_name: str, page_idx: int):
+    key = (doc_name, page_idx)
+    if key not in _page_cache:
+        pdf_path = UPLOAD_DIR / doc_name
+        if not pdf_path.exists():
+            return None
+        try:
+            _page_cache[key] = pdf_page_to_image(str(pdf_path), page_idx)
+        except Exception:
+            logger.warning("[API] Failed to load %s page %d", doc_name, page_idx)
+            return None
+        if len(_page_cache) > _PAGE_CACHE_MAX:
+            keys = list(_page_cache.keys())
+            for k in keys[: len(keys) - _PAGE_CACHE_MAX + 16]:
+                del _page_cache[k]
+    return _page_cache[key]
 
 
 def get_components():
@@ -66,14 +85,7 @@ def get_doc_names():
 
 
 def get_page_image(doc_name: str, page_idx: int):
-    if doc_name not in _image_cache:
-        pdf_path = UPLOAD_DIR / doc_name
-        if pdf_path.exists():
-            _image_cache[doc_name] = pdf_to_images(str(pdf_path))
-        else:
-            return None
-    images = _image_cache.get(doc_name, [])
-    return images[page_idx] if page_idx < len(images) else None
+    return _get_page(doc_name, page_idx)
 
 
 @app.route("/api/query", methods=["POST"])

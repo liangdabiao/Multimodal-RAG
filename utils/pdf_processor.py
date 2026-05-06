@@ -18,6 +18,22 @@ def get_page_count(pdf_path: str) -> int:
         return 0
 
 
+def pdf_page_to_image(pdf_path: str, page_idx: int, dpi: int = None) -> Image.Image:
+    """Load a single page from PDF as PIL Image. Much less memory than loading all pages."""
+    if dpi is None:
+        dpi = settings.pdf_dpi
+    zoom = dpi / 72
+    doc = fitz.open(pdf_path)
+    try:
+        page = doc[page_idx]
+        mat = fitz.Matrix(zoom, zoom)
+        pix = page.get_pixmap(matrix=mat)
+        img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+    finally:
+        doc.close()
+    return img
+
+
 def pdf_to_images(pdf_path: str, dpi: int = None) -> list[Image.Image]:
     """Convert each PDF page to RGB PIL Image using PyMuPDF (no poppler needed)."""
     if dpi is None:
