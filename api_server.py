@@ -20,8 +20,10 @@ POST /api/query
 }
 """
 
+import gc
 import logging
 import traceback
+from collections import OrderedDict
 from pathlib import Path
 
 from flask import Flask, request, jsonify
@@ -44,8 +46,8 @@ app = Flask(__name__)
 UPLOAD_DIR = Path(__file__).parent / "data" / "uploads"
 
 _components = {}
-_page_cache: dict[tuple[str, int], Image.Image] = {}
-_PAGE_CACHE_MAX = 64
+_page_cache: OrderedDict[tuple[str, int], Image.Image] = OrderedDict()
+_PAGE_CACHE_MAX = 48
 
 
 def _load_pages_batch(pages_needed: dict[str, list[int]]):
@@ -66,10 +68,8 @@ def _load_pages_batch(pages_needed: dict[str, list[int]]):
 
 
 def _evict_cache():
-    if len(_page_cache) > _PAGE_CACHE_MAX:
-        keys = list(_page_cache.keys())
-        for k in keys[: len(keys) - _PAGE_CACHE_MAX + 16]:
-            del _page_cache[k]
+    while len(_page_cache) > _PAGE_CACHE_MAX:
+        _page_cache.popitem(last=False)
 
 
 def get_components():

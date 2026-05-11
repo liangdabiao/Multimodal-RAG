@@ -1,12 +1,14 @@
+import gc
 import io
 import logging
 import os
 import traceback
+from collections import OrderedDict
 from pathlib import Path
 from flask import Flask, request, jsonify, send_file
 from PIL import Image
 from config import settings
-from utils.pdf_processor import pdf_to_images, pdf_page_to_image, pdf_pages_to_images, PdfProcessingError
+from utils.pdf_processor import get_page_count, pdf_page_to_image, pdf_pages_to_images, PdfProcessingError
 from core.vector_store import VectorStore
 from core.embedder import create_embedder
 from core.retriever import Retriever, expand_pages
@@ -24,24 +26,26 @@ UPLOAD_DIR = Path(__file__).parent / "data" / "uploads"
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 _components = {}
-# page cache: (doc_name, page_idx) -> PIL.Image, single page per entry
-_page_cache: dict[tuple[str, int], Image.Image] = {}
-_PAGE_CACHE_MAX = 64
+# page cache: (doc_name, page_idx) -> PIL.Image, LRU via OrderedDict
+_page_cache: OrderedDict[tuple[str, int], Image.Image] = OrderedDict()
+_PAGE_CACHE_MAX = 48
 
 
 def _get_page(doc_name: str, page_idx: int):
     """Get a single page image, load from disk if not cached."""
     key = (doc_name, page_idx)
-    if key not in _page_cache:
-        pdf_path = UPLOAD_DIR / doc_name
-        if not pdf_path.exists():
-            return None
-        try:
-            _page_cache[key] = pdf_page_to_image(str(pdf_path), page_idx)
-        except Exception:
-            logger.warning("Failed to load %s page %d", doc_name, page_idx)
-            return None
+    if key in _page_cache:
+        _page_cache.move_to_end(key)
+        return _page_cache[key]
+    pdf_path = UPLOAD_DIR / doc_name
+    if not pdf_path.exists():
+        return None
+    try:
+        _page_cache[key] = pdf_page_to_image(str(pdf_path), page_idx)
         _evict_cache()
+    except Exception:
+        logger.warning("Failed to load %s page %d", doc_name, page_idx)
+        return None
     return _page_cache[key]
 
 
@@ -64,10 +68,9 @@ def _load_pages_batch(pages_needed: dict[str, list[int]]):
 
 
 def _evict_cache():
-    if len(_page_cache) > _PAGE_CACHE_MAX:
-        keys = list(_page_cache.keys())
-        for k in keys[: len(keys) - _PAGE_CACHE_MAX + 16]:
-            del _page_cache[k]
+    """Evict oldest entries (LRU). OrderedDict maintains access order."""
+    while len(_page_cache) > _PAGE_CACHE_MAX:
+        _page_cache.popitem(last=False)
 
 
 def get_components():
@@ -150,17 +153,30 @@ def encode():
         return jsonify({"error": f"File not found: {doc_name}"}), 400
 
     try:
-        logger.info("Converting PDF to images: %s", doc_name)
-        images = pdf_to_images(str(save_path))
-        n_pages = len(images)
-        logger.info("Converted %d pages", n_pages)
+        n_pages = get_page_count(str(save_path))
+        if n_pages == 0:
+            return jsonify({"error": "PDF is empty or unreadable"}), 400
+        logger.info("Encoding %s: %d pages", doc_name, n_pages)
 
         comps = get_components()
-        logger.info("Encoding %d pages via %s API...", n_pages, settings.embed_provider)
-        page_vectors = comps["embedder"].encode_images(images)
-        logger.info("Got %d vectors", len(page_vectors))
+        # Process in batches to avoid loading all pages into memory
+        embed_batch = 8
+        all_vectors = []
 
-        total_rows = comps["vector_store"].insert_pages(doc_name, page_vectors)
+        for start in range(0, n_pages, embed_batch):
+            indices = list(range(start, min(start + embed_batch, n_pages)))
+            logger.info("Loading pages %d-%d/%d", start + 1, start + len(indices), n_pages)
+            page_dict = pdf_pages_to_images(str(save_path), indices)
+            ordered = [page_dict[i] for i in indices if i in page_dict]
+            if not ordered:
+                continue
+            vectors = comps["embedder"].encode_images(ordered)
+            all_vectors.extend(vectors)
+            del page_dict, ordered
+            gc.collect()
+
+        logger.info("Got %d vectors total", len(all_vectors))
+        total_rows = comps["vector_store"].insert_pages(doc_name, all_vectors)
         logger.info("Inserted %d rows into Zilliz", total_rows)
 
         return jsonify({

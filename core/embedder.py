@@ -53,7 +53,7 @@ class CohereEmbedder(BaseEmbedder):
         import cohere
         self.client = cohere.ClientV2(api_key=settings.cohere_api_key)
         self.image_limiter = _RateLimiter(COHERE_IMAGE_LIMIT)
-        self.text_limiter = _RateLimiter(COHREE_TEXT_LIMIT)
+        self.text_limiter = _RateLimiter(COHERE_TEXT_LIMIT)
 
     def encode_images(self, images: list[Image.Image]) -> list[list[float]]:
         batch_size = settings.cohere_batch_size
