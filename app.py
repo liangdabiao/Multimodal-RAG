@@ -6,7 +6,7 @@ from pathlib import Path
 from flask import Flask, request, jsonify, send_file
 from PIL import Image
 from config import settings
-from utils.pdf_processor import pdf_to_images, pdf_page_to_image, PdfProcessingError
+from utils.pdf_processor import pdf_to_images, pdf_page_to_image, pdf_pages_to_images, PdfProcessingError
 from core.vector_store import VectorStore
 from core.embedder import create_embedder
 from core.retriever import Retriever, expand_pages
@@ -41,12 +41,33 @@ def _get_page(doc_name: str, page_idx: int):
         except Exception:
             logger.warning("Failed to load %s page %d", doc_name, page_idx)
             return None
-        # Evict oldest entries if cache too large
-        if len(_page_cache) > _PAGE_CACHE_MAX:
-            keys = list(_page_cache.keys())
-            for k in keys[: len(keys) - _PAGE_CACHE_MAX + 16]:
-                del _page_cache[k]
+        _evict_cache()
     return _page_cache[key]
+
+
+def _load_pages_batch(pages_needed: dict[str, list[int]]):
+    """Batch-load pages grouped by PDF. Each PDF opened once."""
+    for doc_name, indices in pages_needed.items():
+        pdf_path = UPLOAD_DIR / doc_name
+        if not pdf_path.exists():
+            continue
+        uncached = [i for i in indices if (doc_name, i) not in _page_cache]
+        if not uncached:
+            continue
+        try:
+            loaded = pdf_pages_to_images(str(pdf_path), uncached)
+            for idx, img in loaded.items():
+                _page_cache[(doc_name, idx)] = img
+            _evict_cache()
+        except Exception:
+            logger.warning("Batch load failed for %s", doc_name)
+
+
+def _evict_cache():
+    if len(_page_cache) > _PAGE_CACHE_MAX:
+        keys = list(_page_cache.keys())
+        for k in keys[: len(keys) - _PAGE_CACHE_MAX + 16]:
+            del _page_cache[k]
 
 
 def get_components():
@@ -88,14 +109,14 @@ def list_docs():
 
 @app.route("/api/image/<doc_name>/<int:page_idx>")
 def serve_image(doc_name, page_idx):
-    """Serve a PDF page as PNG image."""
+    """Serve a PDF page as JPEG image."""
     img = get_page_image(doc_name, page_idx)
     if img is None:
         return "Not found", 404
     buf = io.BytesIO()
-    img.save(buf, format="PNG")
+    img.save(buf, format="JPEG", quality=85)
     buf.seek(0)
-    return send_file(buf, mimetype="image/png")
+    return send_file(buf, mimetype="image/jpeg")
 
 
 @app.route("/api/upload", methods=["POST"])
@@ -179,20 +200,32 @@ def search():
 
         expanded = expand_pages(results, UPLOAD_DIR, window=2)
 
+        # Batch-load all expanded pages (one PDF open per document)
+        pages_by_doc: dict[str, list[int]] = {}
+        for doc_name_e, page_idx, _ in expanded:
+            pages_by_doc.setdefault(doc_name_e, []).append(page_idx)
+        _load_pages_batch(pages_by_doc)
+
+        # Gallery: all expanded pages for frontend display
         gallery = []
-        context_images = []
         for doc_name_e, page_idx, score in expanded:
-            img = get_page_image(doc_name_e, page_idx)
-            if img:
+            key = (doc_name_e, page_idx)
+            if key in _page_cache:
                 label = f"{doc_name_e} - 第{page_idx + 1}页 (相似度: {score})"
                 gallery.append({"label": label, "doc_name": doc_name_e, "page_idx": page_idx})
-                context_images.append(img)
 
-        if not context_images:
-            return jsonify({"pages": [], "answer": "源 PDF 文件未找到，请重新上传。"})
+        # LLM: only core hit pages (not expanded) for faster generation
+        core_images = []
+        for r in results:
+            key = (r.doc_name, r.page_idx)
+            if key in _page_cache:
+                core_images.append(_page_cache[key])
 
-        logger.info("Sending %d images to LLM", len(context_images))
-        answer = comps["generator"].generate(question, context_images)
+        if not core_images:
+            return jsonify({"pages": gallery, "answer": "源 PDF 文件未找到，请重新上传。"})
+
+        logger.info("LLM: %d core images (expanded gallery: %d pages)", len(core_images), len(gallery))
+        answer = comps["generator"].generate(question, core_images)
         logger.info("LLM answer: %s", answer[:100])
 
         return jsonify({"pages": gallery, "answer": answer})

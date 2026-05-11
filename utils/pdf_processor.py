@@ -19,7 +19,7 @@ def get_page_count(pdf_path: str) -> int:
 
 
 def pdf_page_to_image(pdf_path: str, page_idx: int, dpi: int = None) -> Image.Image:
-    """Load a single page from PDF as PIL Image. Much less memory than loading all pages."""
+    """Load a single page from PDF as PIL Image."""
     if dpi is None:
         dpi = settings.pdf_dpi
     zoom = dpi / 72
@@ -32,6 +32,31 @@ def pdf_page_to_image(pdf_path: str, page_idx: int, dpi: int = None) -> Image.Im
     finally:
         doc.close()
     return img
+
+
+def pdf_pages_to_images(pdf_path: str, page_indices: list[int], dpi: int = None) -> dict[int, Image.Image]:
+    """Load multiple pages in one PDF open/close cycle. Returns {page_idx: Image}."""
+    if not page_indices:
+        return {}
+    if dpi is None:
+        dpi = settings.pdf_dpi
+    zoom = dpi / 72
+    result = {}
+    doc = fitz.open(pdf_path)
+    try:
+        total = len(doc)
+        for idx in page_indices:
+            if 0 <= idx < total:
+                page = doc[idx]
+                mat = fitz.Matrix(zoom, zoom)
+                pix = page.get_pixmap(matrix=mat)
+                w = pix.width
+                h = pix.height
+                s = pix.samples
+                result[idx] = Image.frombytes("RGB", [w, h], s)
+    finally:
+        doc.close()
+    return result
 
 
 def pdf_to_images(pdf_path: str, dpi: int = None) -> list[Image.Image]:

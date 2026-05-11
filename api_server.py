@@ -20,15 +20,14 @@ POST /api/query
 }
 """
 
-import io
 import logging
 import traceback
 from pathlib import Path
 
-from flask import Flask, request, jsonify, send_file
+from flask import Flask, request, jsonify
 from PIL import Image
 from config import settings
-from utils.pdf_processor import pdf_page_to_image
+from utils.pdf_processor import pdf_page_to_image, pdf_pages_to_images
 from core.embedder import create_embedder
 from core.vector_store import VectorStore
 from core.retriever import Retriever, expand_pages
@@ -49,22 +48,28 @@ _page_cache: dict[tuple[str, int], Image.Image] = {}
 _PAGE_CACHE_MAX = 64
 
 
-def _get_page(doc_name: str, page_idx: int):
-    key = (doc_name, page_idx)
-    if key not in _page_cache:
+def _load_pages_batch(pages_needed: dict[str, list[int]]):
+    for doc_name, indices in pages_needed.items():
         pdf_path = UPLOAD_DIR / doc_name
         if not pdf_path.exists():
-            return None
+            continue
+        uncached = [i for i in indices if (doc_name, i) not in _page_cache]
+        if not uncached:
+            continue
         try:
-            _page_cache[key] = pdf_page_to_image(str(pdf_path), page_idx)
+            loaded = pdf_pages_to_images(str(pdf_path), uncached)
+            for idx, img in loaded.items():
+                _page_cache[(doc_name, idx)] = img
+            _evict_cache()
         except Exception:
-            logger.warning("[API] Failed to load %s page %d", doc_name, page_idx)
-            return None
-        if len(_page_cache) > _PAGE_CACHE_MAX:
-            keys = list(_page_cache.keys())
-            for k in keys[: len(keys) - _PAGE_CACHE_MAX + 16]:
-                del _page_cache[k]
-    return _page_cache[key]
+            logger.warning("[API] Batch load failed for %s", doc_name)
+
+
+def _evict_cache():
+    if len(_page_cache) > _PAGE_CACHE_MAX:
+        keys = list(_page_cache.keys())
+        for k in keys[: len(keys) - _PAGE_CACHE_MAX + 16]:
+            del _page_cache[k]
 
 
 def get_components():
@@ -83,10 +88,6 @@ def get_components():
 
 def get_doc_names():
     return sorted(f.name for f in UPLOAD_DIR.glob("*.pdf"))
-
-
-def get_page_image(doc_name: str, page_idx: int):
-    return _get_page(doc_name, page_idx)
 
 
 @app.route("/api/query", methods=["POST"])
@@ -116,23 +117,34 @@ def query():
 
         expanded = expand_pages(results, UPLOAD_DIR, window=2)
 
+        # Batch-load all expanded pages
+        pages_by_doc: dict[str, list[int]] = {}
+        for doc_name_e, page_idx, _ in expanded:
+            pages_by_doc.setdefault(doc_name_e, []).append(page_idx)
+        _load_pages_batch(pages_by_doc)
+
+        # Return all expanded pages info
         pages = []
-        context_images = []
         for doc_name_e, page_idx, score in expanded:
-            img = get_page_image(doc_name_e, page_idx)
-            if img:
+            if (doc_name_e, page_idx) in _page_cache:
                 pages.append({
                     "doc_name": doc_name_e,
                     "page_idx": page_idx,
                     "score": score,
                 })
-                context_images.append(img)
 
-        if not context_images:
-            return jsonify({"answer": "源 PDF 文件未找到，请重新上传。", "pages": []})
+        # LLM: only core hit pages
+        core_images = []
+        for r in results:
+            key = (r.doc_name, r.page_idx)
+            if key in _page_cache:
+                core_images.append(_page_cache[key])
 
-        logger.info("[API] 发送 %d 张图片给 LLM", len(context_images))
-        answer = comps["generator"].generate(question, context_images)
+        if not core_images:
+            return jsonify({"answer": "源 PDF 文件未找到，请重新上传。", "pages": pages})
+
+        logger.info("[API] LLM: %d core images (expanded: %d pages)", len(core_images), len(pages))
+        answer = comps["generator"].generate(question, core_images)
         logger.info("[API] 回答: %s", answer[:100])
 
         return jsonify({"answer": answer, "pages": pages})
