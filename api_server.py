@@ -26,6 +26,7 @@ import traceback
 from pathlib import Path
 
 from flask import Flask, request, jsonify, send_file
+from PIL import Image
 from config import settings
 from utils.pdf_processor import pdf_page_to_image
 from core.embedder import create_embedder
