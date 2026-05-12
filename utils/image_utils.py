@@ -8,7 +8,6 @@ def image_to_data_uri(img: Image.Image, max_size: int = None, fmt: str = "png") 
     """Resize image so max dimension <= max_size, convert to base64 data URI."""
     if max_size is None:
         max_size = settings.max_image_size
-    img = img.copy()
     if img.mode != "RGB":
         img = img.convert("RGB")
     w, h = img.size
@@ -30,7 +29,6 @@ def pil_to_base64(img: Image.Image, max_size: int = None, fmt: str = "jpeg") -> 
     """Resize image so max dimension <= max_size, return raw base64 string (no data URI prefix)."""
     if max_size is None:
         max_size = settings.max_image_size
-    img = img.copy()
     if img.mode != "RGB":
         img = img.convert("RGB")
     w, h = img.size
