@@ -26,13 +26,22 @@ UPLOAD_DIR = Path(__file__).parent / "data" / "uploads"
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 _components = {}
-# page cache: (doc_name, page_idx) -> PIL.Image, LRU via OrderedDict
-_page_cache: OrderedDict[tuple[str, int], Image.Image] = OrderedDict()
+# Cache stores compressed JPEG bytes (~300KB/page) instead of raw pixels (~6.5MB/page)
+_page_cache: OrderedDict[tuple[str, int], bytes] = OrderedDict()
 _PAGE_CACHE_MAX = 48
 
 
-def _get_page(doc_name: str, page_idx: int):
-    """Get a single page image, load from disk if not cached."""
+def _img_to_jpeg(img: Image.Image) -> bytes:
+    """Convert PIL Image to JPEG bytes. Closes the input image."""
+    buf = io.BytesIO()
+    if img.mode != "RGB":
+        img = img.convert("RGB")
+    img.save(buf, format="JPEG", quality=85)
+    return buf.getvalue()
+
+
+def _get_page_jpeg(doc_name: str, page_idx: int) -> bytes | None:
+    """Get JPEG bytes for a page, load from disk if not cached."""
     key = (doc_name, page_idx)
     if key in _page_cache:
         _page_cache.move_to_end(key)
@@ -41,7 +50,9 @@ def _get_page(doc_name: str, page_idx: int):
     if not pdf_path.exists():
         return None
     try:
-        _page_cache[key] = pdf_page_to_image(str(pdf_path), page_idx)
+        img = pdf_page_to_image(str(pdf_path), page_idx)
+        _page_cache[key] = _img_to_jpeg(img)
+        img.close()
         _evict_cache()
     except Exception:
         logger.warning("Failed to load %s page %d", doc_name, page_idx)
@@ -50,7 +61,7 @@ def _get_page(doc_name: str, page_idx: int):
 
 
 def _load_pages_batch(pages_needed: dict[str, list[int]]):
-    """Batch-load pages grouped by PDF. Each PDF opened once."""
+    """Batch-load pages grouped by PDF. Converts to JPEG bytes immediately."""
     for doc_name, indices in pages_needed.items():
         pdf_path = UPLOAD_DIR / doc_name
         if not pdf_path.exists():
@@ -61,14 +72,17 @@ def _load_pages_batch(pages_needed: dict[str, list[int]]):
         try:
             loaded = pdf_pages_to_images(str(pdf_path), uncached)
             for idx, img in loaded.items():
-                _page_cache[(doc_name, idx)] = img
+                _page_cache[(doc_name, idx)] = _img_to_jpeg(img)
+                img.close()
+            del loaded
             _evict_cache()
+            gc.collect()
         except Exception:
             logger.warning("Batch load failed for %s", doc_name)
 
 
 def _evict_cache():
-    """Evict oldest entries (LRU). OrderedDict maintains access order."""
+    """Evict oldest entries (LRU)."""
     while len(_page_cache) > _PAGE_CACHE_MAX:
         _page_cache.popitem(last=False)
 
@@ -95,10 +109,6 @@ def get_doc_names():
     return sorted(f.name for f in UPLOAD_DIR.glob("*.pdf"))
 
 
-def get_page_image(doc_name: str, page_idx: int):
-    return _get_page(doc_name, page_idx)
-
-
 @app.route("/")
 def index():
     return send_file("static/index.html")
@@ -112,14 +122,11 @@ def list_docs():
 
 @app.route("/api/image/<doc_name>/<int:page_idx>")
 def serve_image(doc_name, page_idx):
-    """Serve a PDF page as JPEG image."""
-    img = get_page_image(doc_name, page_idx)
-    if img is None:
+    """Serve a PDF page as JPEG image. Uses cached JPEG bytes directly."""
+    jpeg_bytes = _get_page_jpeg(doc_name, page_idx)
+    if jpeg_bytes is None:
         return "Not found", 404
-    buf = io.BytesIO()
-    img.save(buf, format="JPEG", quality=85)
-    buf.seek(0)
-    return send_file(buf, mimetype="image/jpeg")
+    return send_file(io.BytesIO(jpeg_bytes), mimetype="image/jpeg")
 
 
 @app.route("/api/upload", methods=["POST"])
@@ -172,6 +179,8 @@ def encode():
                 continue
             vectors = comps["embedder"].encode_images(ordered)
             all_vectors.extend(vectors)
+            for img in ordered:
+                img.close()
             del page_dict, ordered
             gc.collect()
 
@@ -197,7 +206,6 @@ def search():
     if not question:
         return jsonify({"error": "Please enter a question"}), 400
 
-    # Check that at least some docs exist on disk
     if not get_doc_names():
         return jsonify({"error": "No documents uploaded yet"}), 400
 
@@ -216,13 +224,13 @@ def search():
 
         expanded = expand_pages(results, UPLOAD_DIR, window=2)
 
-        # Batch-load all expanded pages (one PDF open per document)
+        # Batch-load all expanded pages as JPEG bytes
         pages_by_doc: dict[str, list[int]] = {}
         for doc_name_e, page_idx, _ in expanded:
             pages_by_doc.setdefault(doc_name_e, []).append(page_idx)
         _load_pages_batch(pages_by_doc)
 
-        # Gallery: all expanded pages for frontend display
+        # Gallery: all expanded pages for frontend display (metadata only)
         gallery = []
         for doc_name_e, page_idx, score in expanded:
             key = (doc_name_e, page_idx)
@@ -230,20 +238,28 @@ def search():
                 label = f"{doc_name_e} - 第{page_idx + 1}页 (相似度: {score})"
                 gallery.append({"label": label, "doc_name": doc_name_e, "page_idx": page_idx})
 
-        # LLM: only core hit pages (not expanded) for faster generation
+        # LLM: decode JPEG bytes to temporary PIL Images
         core_images = []
         for r in results:
             key = (r.doc_name, r.page_idx)
             if key in _page_cache:
-                core_images.append(_page_cache[key])
+                img = Image.open(io.BytesIO(_page_cache[key]))
+                img.load()
+                core_images.append(img)
 
         if not core_images:
             return jsonify({"pages": gallery, "answer": "源 PDF 文件未找到，请重新上传。"})
 
         logger.info("LLM: %d core images (expanded gallery: %d pages)", len(core_images), len(gallery))
         answer = comps["generator"].generate(question, core_images)
-        logger.info("LLM answer: %s", answer[:100])
 
+        # Immediately free decoded PIL Images after LLM call
+        for img in core_images:
+            img.close()
+        del core_images
+        gc.collect()
+
+        logger.info("LLM answer: %s", answer[:100])
         return jsonify({"pages": gallery, "answer": answer})
     except Exception as e:
         logger.error("Search failed: %s\n%s", e, traceback.format_exc())
@@ -264,6 +280,7 @@ def clear():
     for f in UPLOAD_DIR.glob("*.pdf"):
         f.unlink()
     _page_cache.clear()
+    gc.collect()
     logger.info("All data cleared")
     return jsonify({"status": "ok"})
 
